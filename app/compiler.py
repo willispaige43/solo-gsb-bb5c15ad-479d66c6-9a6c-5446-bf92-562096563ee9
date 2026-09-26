@@ -32,6 +32,11 @@ class CompileError(Exception):
         self.message = message
         self.details = details or {}
 
+    def __reduce__(self) -> tuple[type, tuple[str, str, dict[str, Any]]]:
+        # 支持 pickle：对账等工作进程内抛出的业务异常可随
+        # ProcessPoolExecutor 的结果原样回传主进程，仍由 HTTP 层转换为 422
+        return (self.__class__, (self.code, self.message, self.details))
+
     def to_dict(self) -> dict[str, Any]:
         body: dict[str, Any] = {"code": self.code, "message": self.message}
         if self.details:

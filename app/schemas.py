@@ -749,6 +749,8 @@ class ErrorBody(BaseModel):
         "INVALID_REPLAY_PADDING",
         "INVALID_REPLAY_BUDGET",
         "TOO_MANY_REPLAY_CANDIDATES",
+        "RECONCILE_BUSY",
+        "RECONCILE_TIMEOUT",
     ]
     message: str
     details: dict | None = None
