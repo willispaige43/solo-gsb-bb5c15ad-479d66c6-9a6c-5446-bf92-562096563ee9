@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from fastapi import FastAPI, Request
+import asyncio
+import os
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -15,7 +19,7 @@ from .interruptions import plan_interruption
 from .merge import merge_versions
 from .preload import plan_preload
 from .rebalance import rebalance_schedule
-from .reconcile import reconcile_runs
+from .reconcile_worker import ReconcileTimeout, ReconcileWorker
 from .replays import plan_replays
 from .routing import assign_routing
 from .schemas import (
@@ -46,9 +50,36 @@ from .schemas import (
     RoutingAssignResponse,
 )
 
+_DEFAULT_RECONCILE_TIMEOUT_SEC = 10.0
+
+
+def _reconcile_timeout_seconds() -> float:
+    """读取对账任务超时时长（秒，含排队时间）；未设置或非法时回退默认 10 秒。"""
+    raw = os.environ.get("RECONCILE_TIMEOUT_SECONDS")
+    if raw is None:
+        return _DEFAULT_RECONCILE_TIMEOUT_SEC
+    try:
+        value = float(raw)
+    except ValueError:
+        return _DEFAULT_RECONCILE_TIMEOUT_SEC
+    return value if value > 0 else _DEFAULT_RECONCILE_TIMEOUT_SEC
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """应用生命周期：随启动创建对账专属工作进程，随关闭回收。"""
+    worker = ReconcileWorker()
+    await worker.start()
+    _app.state.reconcile_worker = worker
+    try:
+        yield
+    finally:
+        await worker.stop()
+
+
 app = FastAPI(
     title="直播导播口令编排 API",
-    version="1.11.0",
+    version="1.12.0",
     description=(
         "接收导播口令数组，解析锚点依赖得到每条口令的起止毫秒时间，"
         "并列出同通道半开区间重叠的冲突 id 对；"
@@ -72,8 +103,12 @@ app = FastAPI(
         "每个候选生成 [max(0, 起点-前留白), 终点+后留白) 的全局录制窗口，"
         "跨通道重叠或首尾相接的窗口合并后才计入回放时长预算，"
         "求预算内优先级总和最大、并列入选条数最多、"
-        "再并列入选 id 升序列表字典序最小的集合。"
+        "再并列入选 id 升序列表字典序最小的集合；"
+        "实播对账的计算在应用生命周期管理的专属单工作进程中串行执行，"
+        "未结束任务（执行中与排队中合计）最多 2 个，单任务超时由 "
+        "RECONCILE_TIMEOUT_SECONDS 配置，长对账期间健康检查等接口照常响应。"
     ),
+    lifespan=lifespan,
 )
 
 
@@ -102,6 +137,14 @@ async def validation_exception_handler(
 @app.get("/health", tags=["meta"], summary="健康检查")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+async def _wait_client_disconnect(request: Request) -> None:
+    """阻塞至客户端断开连接（请求体已被 FastAPI 消费，后续消息只可能是断连）。"""
+    while True:
+        message = await request.receive()
+        if message["type"] == "http.disconnect":
+            return
 
 
 @app.post(
@@ -147,17 +190,81 @@ async def rebalance(body: RebalanceRequest) -> dict:
     response_model=ReconcileResponse,
     tags=["runs"],
     summary="实播对账：计划口令与实播记录的保序最优匹配",
-    responses={422: {"model": ErrorBody, "description": "请求非法或对账失败"}},
+    responses={
+        422: {"model": ErrorBody, "description": "请求非法或对账失败"},
+        503: {
+            "model": ErrorBody,
+            "description": "对账任务满额（执行中与排队中合计达到上限），未提交计算",
+        },
+        504: {
+            "model": ErrorBody,
+            "description": "对账任务在时限内未完成（自接纳起算，含排队时间）",
+        },
+    },
 )
-async def reconcile(body: ReconcileRequest) -> dict:
-    # 核心逻辑不依赖 Pydantic，直接喂入 dict 以便独立测试与复用
-    return reconcile_runs(
-        [item.model_dump() for item in body.commands],
-        [record.model_dump() for record in body.records],
-        tolerance_ms=body.tolerance_ms,
-        miss_penalty=body.miss_penalty,
-        extra_penalty=body.extra_penalty,
-    )
+async def reconcile(body: ReconcileRequest, request: Request) -> dict:
+    # 核心逻辑不依赖 Pydantic，直接喂入 dict 以便独立测试与复用；
+    # 计算提交到应用生命周期管理的专属单工作进程，事件循环只负责排队与计时
+    payload = {
+        "commands": [item.model_dump() for item in body.commands],
+        "records": [record.model_dump() for record in body.records],
+        "tolerance_ms": body.tolerance_ms,
+        "miss_penalty": body.miss_penalty,
+        "extra_penalty": body.extra_penalty,
+    }
+    worker: ReconcileWorker = app.state.reconcile_worker
+    future = worker.submit(payload, timeout_sec=_reconcile_timeout_seconds())
+    if future is None:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "code": "RECONCILE_BUSY",
+                "message": "对账任务满额：未结束任务（执行中与排队中合计）已达上限，请稍后重试",
+                "details": {"max_inflight": ReconcileWorker.MAX_INFLIGHT},
+            },
+        )
+    # 监听客户端断连（ASGI http.disconnect）：uvicorn 不会在断连时自动取消
+    # 端点协程，需要主动监听，才能让排队任务及时撤销、释放名额
+    disconnect = asyncio.create_task(_wait_client_disconnect(request))
+    try:
+        await asyncio.wait(
+            {future, disconnect}, return_when=asyncio.FIRST_COMPLETED
+        )
+    except asyncio.CancelledError:
+        disconnect.cancel()
+        future.cancel()
+        worker.cancel(future)
+        raise
+    if disconnect.done() and not disconnect.cancelled():
+        disconnect.exception()  # 取出可能的异常，避免未检索告警
+    disconnect.cancel()
+    if not future.done():
+        # 客户端先断开：排队任务撤销并立即释放名额，执行中任务弃置、结果丢弃
+        future.cancel()
+        worker.cancel(future)
+        return Response(status_code=204)
+    try:
+        outcome = future.result()
+    except ReconcileTimeout:
+        return JSONResponse(
+            status_code=504,
+            content={
+                "code": "RECONCILE_TIMEOUT",
+                "message": "对账任务在时限内未完成（自接纳起算，含排队时间）",
+                "details": {"timeout_seconds": _reconcile_timeout_seconds()},
+            },
+        )
+    if outcome[0] == "ok":
+        return outcome[1]
+    if outcome[0] == "error":
+        # 业务错误保持原有 422 + 结构化错误码（与同步执行时完全一致）
+        _, code, message, details = outcome
+        content: dict = {"code": code, "message": message}
+        if details:
+            content["details"] = details
+        return JSONResponse(status_code=422, content=content)
+    # 工作进程内出现业务逻辑之外的异常
+    raise RuntimeError(f"对账工作进程执行失败: {outcome[1]}")
 
 
 @app.post(

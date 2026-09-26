@@ -6,6 +6,9 @@ services:
     ports:
       # 宿主机端口可用环境变量 PUBLISH_PORT 覆盖，默认 8000
       - "${PUBLISH_PORT:-8000}:8000"
+    environment:
+      # 对账任务超时（秒，自接纳起算、含排队时间），默认 10
+      - RECONCILE_TIMEOUT_SECONDS=${RECONCILE_TIMEOUT_SECONDS:-10}
     restart: unless-stopped
     healthcheck:
       test:

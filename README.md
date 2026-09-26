@@ -69,6 +69,7 @@ docker compose down
 | --- | --- | --- |
 | 容器监听端口 | 固定 `8000`（由 `uvicorn --port 8000` 指定） | `8000` |
 | 宿主机映射端口 | Compose 读取环境变量 `PUBLISH_PORT`，映射为 `${PUBLISH_PORT}:8000` | `8000` |
+| 对账任务超时 | 环境变量 `RECONCILE_TIMEOUT_SECONDS`（秒，自接纳起算、含排队时间），超时返回 `504` + `RECONCILE_TIMEOUT` | `10` |
 | 依赖安装 | `Dockerfile` 构建时执行 `pip install -r requirements.txt` | 自动 |
 
 如需改用宿主机 9000 端口：
@@ -77,7 +78,13 @@ docker compose down
 PUBLISH_PORT=9000 docker compose up --build -d
 ```
 
-服务无数据库、无外部依赖，不需要额外配置环境变量。
+如需把对账超时调整为 30 秒：
+
+```bash
+RECONCILE_TIMEOUT_SECONDS=30 docker compose up --build -d
+```
+
+服务无数据库、无外部依赖；除上述可选环境变量外不需要额外配置。
 
 ## 接口约定：`POST /compile`
 
@@ -482,6 +489,18 @@ curl -s http://localhost:8000/schedule/rebalance \
 - `extra_actual_ids`：未匹配的实播记录 id（额外播出），按 id 升序。
 - `total_penalty`：总罚分。
 
+执行模型（并发与超时）：
+
+- 对账计算在**应用启动时创建的专属单工作进程**中串行执行，不阻塞事件循环：
+  长对账期间 `GET /health` 及其他接口照常响应；工作进程随应用关闭回收
+  （执行中的任务会跑完再退出）。
+- 未结束任务（执行中与排队中合计）最多 **2 个**；满额时新请求**立即**返回
+  `503` + `RECONCILE_BUSY`，不提交计算。
+- 每个任务自**接纳时刻**起按 `RECONCILE_TIMEOUT_SECONDS`（秒，默认 `10`）
+  计时，**排队时间计入**；到期返回 `504` + `RECONCILE_TIMEOUT`。
+- 超时或客户端断开时：仍在排队的任务直接撤销并立即释放名额（不会被执行）；
+  已在执行的任务无法打断，名额保留到其**实际结束**才释放，迟到的结果直接丢弃。
+
 ### 请求示例（正常对账）
 
 ```bash
@@ -561,6 +580,30 @@ curl -s http://localhost:8000/runs/reconcile \
   "code": "INVALID_INTERVAL",
   "message": "实播区间非法：actual_start_ms 不得为负，且 actual_end_ms 必须大于 actual_start_ms",
   "details": { "ids": ["r1"] }
+}
+```
+
+### 响应示例（任务满额，503）
+
+已有 2 个未结束任务（执行中 + 排队中）时，新请求立即被拒绝、不提交计算：
+
+```json
+{
+  "code": "RECONCILE_BUSY",
+  "message": "对账任务满额：未结束任务（执行中与排队中合计）已达上限，请稍后重试",
+  "details": { "max_inflight": 2 }
+}
+```
+
+### 响应示例（任务超时，504）
+
+任务自接纳起超过 `RECONCILE_TIMEOUT_SECONDS`（默认 10 秒，含排队时间）仍未完成：
+
+```json
+{
+  "code": "RECONCILE_TIMEOUT",
+  "message": "对账任务在时限内未完成（自接纳起算，含排队时间）",
+  "details": { "timeout_seconds": 10.0 }
 }
 ```
 
@@ -1599,6 +1642,10 @@ curl -s http://localhost:8000/replays/plan \
 }
 ```
 
+`POST /runs/reconcile` 的任务调度错误使用同样的响应体结构，但状态码不同：
+任务满额返回 `503` + `RECONCILE_BUSY`，任务超时返回 `504` + `RECONCILE_TIMEOUT`
+（见该接口的「执行模型」一节）。
+
 错误码：
 
 | `code` | 触发条件 |
@@ -1642,6 +1689,8 @@ curl -s http://localhost:8000/replays/plan \
 | `INVALID_REPLAY_PADDING` | 仅 `POST /replays/plan`：`lead_in_ms` 或 `lead_out_ms` 为负数 |
 | `INVALID_REPLAY_BUDGET` | 仅 `POST /replays/plan`：`budget_ms` 不是正数 |
 | `TOO_MANY_REPLAY_CANDIDATES` | 仅直接调用核心逻辑时：候选超过 12 条（HTTP 层由请求结构校验提前返回 `INVALID_REQUEST`） |
+| `RECONCILE_BUSY` | 仅 `POST /runs/reconcile`（HTTP `503`）：未结束任务（执行中与排队中合计）已达上限 2 个，请求未被接纳、不提交计算 |
+| `RECONCILE_TIMEOUT` | 仅 `POST /runs/reconcile`（HTTP `504`）：任务自接纳起超过 `RECONCILE_TIMEOUT_SECONDS`（默认 10 秒，含排队时间）仍未完成 |
 
 > `POST /versions/merge` 的字段级分歧不是错误：无论是否合并成功都返回 HTTP `200`，
 > 由响应体的 `status`（`merged` / `diverged`）区分；仅版本内部重复 id
@@ -1672,6 +1721,11 @@ curl -s http://localhost:8000/replays/plan \
 - `actual_start_ms` 为负、或 `actual_end_ms` 不大于 `actual_start_ms` 时，
   返回 `INVALID_INTERVAL`。
 - 计划口令与实播记录同时非法时，先返回计划侧（`commands`）的错误码。
+- 对账在专属单工作进程中串行执行，未结束任务（执行中与排队中合计）上限 2 个，
+  满额立即返回 `503` + `RECONCILE_BUSY`（请求体仍先做结构校验）。
+- 超时（默认 10 秒，`RECONCILE_TIMEOUT_SECONDS` 可配，含排队时间）返回
+  `504` + `RECONCILE_TIMEOUT`：排队任务撤销并立即释放名额，执行中任务须等
+  实际结束才释放名额、迟到结果丢弃；客户端中途断开按同样规则处理。
 
 `POST /runs/calibrate` 额外约定：
 
@@ -1819,7 +1873,8 @@ uvicorn app.main:app --reload --port 8000
 ```
 
 核心编排逻辑位于 `app/compiler.py`，节目单延误分摊逻辑位于 `app/rebalance.py`，
-实播对账逻辑位于 `app/reconcile.py`，时钟校准逻辑位于 `app/calibrate.py`，
+实播对账逻辑位于 `app/reconcile.py`（其专属单工作进程执行器位于
+`app/reconcile_worker.py`，含并发名额与超时控制），时钟校准逻辑位于 `app/calibrate.py`，
 通道改派逻辑位于 `app/routing.py`，
 口令三方合并逻辑位于 `app/merge.py`，临时插播规划逻辑位于
 `app/interruptions.py`，空档填充规划逻辑位于 `app/fillers.py`，
@@ -1846,10 +1901,11 @@ python3 -m unittest discover -s tests
 │   ├── preload.py         # 纯标准库的素材预载规划（单台串行加载器 + 子集 DP 最早完工与字典序裁决）
 │   ├── rebalance.py       # 纯标准库的节目单延误分摊（固定点切窗 + 余量比例分摊）
 │   ├── reconcile.py       # 纯标准库的实播对账（通道内保序一对一匹配 + 最小罚分 DP）
+│   ├── reconcile_worker.py # 对账专属单工作进程执行器（应用生命周期管理 + 2 名额 / 超时 / 取消语义）
 │   ├── replays.py         # 纯标准库的回放窗口预算规划（全局窗口合并 + 子集枚举三目标裁决）
 │   ├── routing.py         # 纯标准库的通道改派（位掩码分支限界：最少改派 + 字典序裁决）
 │   ├── schemas.py         # Pydantic 请求与响应模型
-│   └── main.py            # FastAPI 入口（/compile、/preview、/schedule/rebalance、/runs/reconcile、/runs/calibrate、/routing/assign、/versions/merge、/interruptions/plan、/fillers/plan、/branches/select、/assets/preload、/replays/plan、/health、统一错误处理）
+│   └── main.py            # FastAPI 入口（/compile、/preview、/schedule/rebalance、/runs/reconcile、/runs/calibrate、/routing/assign、/versions/merge、/interruptions/plan、/fillers/plan、/branches/select、/assets/preload、/replays/plan、/health、对账工作进程生命周期、统一错误处理）
 ├── tests/
 │   ├── test_branches.py       # 开关分支选择核心逻辑单元测试（标准库 unittest）
 │   ├── test_calibrate.py      # 时钟校准核心逻辑单元测试（标准库 unittest）
@@ -1860,6 +1916,8 @@ python3 -m unittest discover -s tests
 │   ├── test_preload.py        # 素材预载规划核心逻辑单元测试（含子集 × 全排列暴力对照 fuzz）
 │   ├── test_rebalance.py      # 延误分摊核心逻辑单元测试（标准库 unittest）
 │   ├── test_reconcile.py      # 实播对账核心逻辑单元测试（标准库 unittest）
+│   ├── test_reconcile_api.py  # 对账接口端到端测试（uvicorn 真实服务 + httpx，缺依赖时自动跳过）
+│   ├── test_reconcile_worker.py # 对账工作进程执行器单元测试（名额 / 超时 / 取消 / 回收，标准库 unittest）
 │   ├── test_replays.py        # 回放窗口预算规划核心逻辑单元测试（含暴力枚举对照 fuzz）
 │   └── test_routing.py        # 通道改派核心逻辑单元测试（标准库 unittest）
 ├── requirements.txt
